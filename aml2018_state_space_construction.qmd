@@ -1,0 +1,827 @@
+---
+title: "Constructing AML State-Space: mRNA (2018 Cohort)"
+format: html
+author: Danya Hassan
+knitr:
+  opts_chunk:
+    echo: TRUE
+    warning: FALSE
+    error: TRUE
+---
+
+## Overview
+
+This document constructs the AML transcriptomic state-space from the 2018 mRNA
+cohort. The pipeline covers data loading and filtering, SVD-based dimensionality
+reduction, rotation of the PC space so that control trajectories are flat, 
+identification of critical points (c₁, c₂, c₃) via k-means clustering, and
+construction of the quasi-potential double-well curve.
+
+---
+
+## 1. Setup
+
+```{r}
+#| label: libraries
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(gt)
+library(SummarizedExperiment)
+library(patchwork)
+```
+
+```{r}
+#| label: load-data
+
+mrna_2018 <- readRDS("AML_mRNA_2018_1_real.rds")
+```
+
+---
+
+## 2. Data Exploration
+
+```{r}
+#| label: explore-se
+
+head(mrna_2018)
+assays(mrna_2018)
+```
+
+```{r}
+#| label: sample-metadata
+
+mrna18_info <- as.data.frame(colData(mrna_2018))
+```
+
+There are 14 mice in the 2018 AML experiment: 7 healthy (Ctrl) and 7 CM.
+
+```{r}
+#| label: mouse-counts
+
+length(unique(mrna18_info$mouse_id))
+
+mrna18_info %>%
+  group_by(treatment) %>%
+  summarise(n_mice = n_distinct(mouse_id))
+```
+
+Starting dimensions: 33,789 genes × 139 sample collections.
+
+```{r}
+#| label: data-dimensions
+
+dim(assay(mrna_2018, "tpm"))
+```
+
+---
+
+## 3. Data Filtering and Log-Scaling
+
+Remove zero-expression rows, log₂-transform with a minimum-value offset, and
+mean-center across Ctrl + CM samples to construct the state-space matrix.
+
+```{r}
+#| label: filtering-and-scaling
+
+# Identify genes with any non-zero TPM expression
+lowExpRM <- which(rowSums(data.matrix(assay(mrna_2018, "tpm"))) > 0)
+
+# Minimum non-zero offsets (to avoid log(0))
+minexp  <- min(data.matrix(assay(mrna_2018, "counts"))[
+                 data.matrix(assay(mrna_2018, "counts")) > 0])
+minabd  <- min(data.matrix(assay(mrna_2018, "tpm"))[
+                 data.matrix(assay(mrna_2018, "tpm")) > 0])
+
+# Log₂-scaled, mean-centered TPM matrix (samples × genes)
+dat.mc <- scale(t(log2(data.matrix(assay(mrna_2018, "tpm")) + minabd)), scale = FALSE)
+assays(mrna_2018)$almc <- t(dat.mc)   # abundance log mean-centered
+
+# Log₂-scaled TPM (no centering)
+dat.alog <- log2(data.matrix(assay(mrna_2018, "tpm")) + minabd)
+assays(mrna_2018)$alog <- dat.alog    # abundance log
+
+# Subset to Ctrl and CM samples for state-space construction
+ldat  <- log2(data.matrix(assay(mrna_2018, "tpm")) + minabd)
+cbsel <- which(colData(mrna_2018)$treatment == "Ctrl" |
+               colData(mrna_2018)$treatment == "CM")
+cb.mc <- rowMeans(ldat[, cbsel])
+
+# Mean-center using Ctrl+CM means; drop low-expression genes
+cb.almc <- sweep(ldat[lowExpRM, cbsel], 1, cb.mc[lowExpRM], FUN = "-")
+```
+
+---
+
+## 4. SVD — State-Space Construction
+
+Perform singular value decomposition on the centered expression matrix.
+Rows of **U** are sample coordinates (PCs); columns of **V** are gene loadings
+(eigengenes).
+
+```{r}
+#| label: svd
+
+bsvd <- svd(t(cb.almc))
+bV   <- bsvd$v
+bU   <- bsvd$u
+bD   <- bsvd$d
+bDm  <- diag(bD)
+
+rownames(bV) <- rowData(mrna_2018)$gene_name[lowExpRM]
+rownames(bU) <- colnames(mrna_2018)[cbsel]
+```
+
+```{r}
+#| label: svd-dimensions
+
+print(paste("Dim of U:", paste(dim(bU), collapse = " x "),
+            "| Dim of V:", paste(dim(bV), collapse = " x "),
+            "| Dim of D:", length(bD)))
+```
+
+Variance explained by each PC:
+
+```{r}
+#| label: variance-explained
+
+barplot(bD / sum(bD) * 100,
+        col    = "black",
+        border = NA,
+        xlab   = "PC",
+        ylab   = "% Variance Explained",
+        main   = "Scree Plot — AML mRNA SVD")
+```
+
+---
+
+## 5. Encode Timepoints as Numeric
+
+Convert `T#` timepoint labels (e.g. `T2p5`) to numeric weeks.
+
+```{r}
+#| label: timepoint-encoding
+
+mrna18_info <- mrna18_info %>%
+  mutate(time_numeric = as.numeric(gsub("p", ".", gsub("T", "", timepoint))))
+
+# Align back to the SummarizedExperiment by library_id
+idx <- match(colData(mrna_2018)$library_id, mrna18_info$library_id)
+colData(mrna_2018)$time_numeric <- mrna18_info$time_numeric[idx]
+```
+
+Build the initial sample dataframe with PC coordinates and metadata:
+
+```{r}
+#| label: build-sdf
+
+sdf <- data.frame(
+  PC1        = bU[, 1],
+  PC2        = bU[, 2],
+  PC3        = bU[, 3],
+  PC4        = bU[, 4],
+  PC5        = bU[, 5],
+  PC6        = bU[, 6],
+  PC7        = bU[, 7],
+  Treatment  = colData(mrna_2018)$treatment[cbsel],
+  Time       = colData(mrna_2018)$time_numeric[cbsel],
+  mouse_id   = colData(mrna_2018)$mouse_id[cbsel],
+  group      = colData(mrna_2018)$cohort[cbsel]
+)
+
+head(sdf)
+```
+
+---
+
+## 6. Eigengenes for PC2
+
+Eigengenes are the gene loadings (columns of **V**) for a given PC — the genes
+that most strongly define the state-space axis.
+
+```{r}
+#| label: eigengenes-pc2
+
+eigengene_PC2        <- bV[, 2]
+names(eigengene_PC2) <- rownames(bV)
+
+# Variance-weighted version (scales magnitude to reflect explained variance)
+eigengene_pc2_scaled <- eigengene_PC2 * bD[2]
+```
+
+Sanity check — reconstructed PC2 scores should correlate perfectly with bU[,2]:
+
+```{r}
+#| label: eigengene-sanity-check
+
+pc2_recon <- t(cb.almc) %*% eigengene_PC2
+cor(pc2_recon, bU[, 2])   # expected: ±1
+```
+
+Top genes driving PC2 separation:
+
+```{r}
+#| label: top-pc2-genes
+
+top_pc2_genes <- sort(abs(eigengene_PC2), decreasing = TRUE)
+head(top_pc2_genes, 20)
+```
+
+Save eigengene table:
+
+```{r}
+#| label: save-eigengenes
+
+eigengene_PC2_df <- data.frame(
+  gene                 = names(eigengene_PC2),
+  eigengene_PC2        = eigengene_PC2,
+  eigengene_PC2_scaled = eigengene_pc2_scaled
+)
+
+write.csv(eigengene_PC2_df, "eigengenes_PC2_aml2018.csv", row.names = FALSE)
+```
+
+---
+
+## 7. Rotating the State-Space
+
+Rotate the PC1–PC2 plane so that the linear fit through **Ctrl** samples has
+slope ≈ 0 (i.e., control trajectories are flat). PC2 is flipped if necessary
+so that the leukemic state corresponds to negative PC2 values.
+
+```{r}
+#| label: flip-pc2
+
+# Ensure CM samples are in the negative PC2 direction
+if (mean(bU[, 2][which(sdf$Treatment == "CM")]) > 0) {
+  bU[, 2] <- bU[, 2] * -1
+}
+```
+
+Scan rotation angles to find the one that minimises the slope of the Ctrl fit:
+
+```{r}
+#| label: find-rotation-angle
+
+test_deg <- seq(-3, 3, by = 0.001)
+mlist    <- numeric(length(test_deg))
+
+for (i in seq_along(test_deg)) {
+  deg   <- test_deg[i]
+  theta <- deg * pi / 180
+  RotM  <- matrix(c(cos(theta), sin(theta), -sin(theta), cos(theta)),
+                  nrow = 2, ncol = 2)
+  rU_test <- bU[, c(1, 2)] %*% bDm[c(1, 2), c(1, 2)] %*% RotM
+
+  r.exp.test <- data.frame(
+    PC1       = rU_test[, 1],
+    PC2       = rU_test[, 2],
+    Treatment = colData(mrna_2018)$treatment[cbsel]
+  )
+
+  ctrl_fit <- lm(
+    PC2 ~ PC1,
+    data = r.exp.test[r.exp.test$Treatment == "Ctrl", ]
+  )
+  mlist[i] <- ctrl_fit$coefficients[[2]]
+}
+
+minM  <- which(abs(mlist) == min(abs(mlist)))
+deg   <- test_deg[minM]
+theta <- deg * pi / 180
+
+cat("Optimal rotation angle:", deg, "degrees\n")
+```
+
+Apply the rotation:
+
+```{r}
+#| label: apply-rotation
+
+RotM <- matrix(c(cos(theta), sin(theta), -sin(theta), cos(theta)),
+               nrow = 2, ncol = 2)
+
+rU <- bU[, c(1, 2)] %*% bDm[c(1, 2), c(1, 2)] %*% RotM   # scale by eigenvalues
+rV <- bV[, c(1, 2)] %*% RotM
+rownames(rV) <- rowData(mrna_2018[lowExpRM, ])$gene_name
+
+r.exp.df <- data.frame(
+  PC1        = rU[, 1],
+  PC2        = rU[, 2],
+  Treatment  = colData(mrna_2018)$treatment[cbsel],
+  Time       = colData(mrna_2018)$time_numeric[cbsel],
+  mouse_id   = colData(mrna_2018)$mouse_id[cbsel],
+  Sex        = colData(mrna_2018)$sex[cbsel],
+  group_name = colData(mrna_2018)$cohort[cbsel]
+)
+
+r.ctrl.fit <- lm(
+  PC2 ~ PC1,
+  data = r.exp.df[r.exp.df$Treatment == "Ctrl", ]
+)
+
+r.ctrl.fit
+```
+
+```{r}
+#| label: plot-rotated-space
+#| fig-width: 6
+#| fig-height: 5
+
+ggplot(r.exp.df, aes(x = PC1, y = PC2, color = Treatment)) +
+  geom_point(size = 2) +
+  geom_abline(
+    intercept = r.ctrl.fit$coefficients[[1]],
+    slope     = r.ctrl.fit$coefficients[[2]],
+    linetype  = "dashed",
+    color     = "black"
+  ) +
+  theme_bw(base_size = 16) +
+  ggtitle("AML mRNA — Rotated State-Space (PC1 vs PC2)")
+```
+
+```{r}
+#| label: plot-pc2-vs-time
+#| fig-width: 7
+#| fig-height: 5
+
+ggplot(r.exp.df, aes(x = Time, y = PC2, color = Treatment, group = mouse_id)) +
+  geom_point() +
+  geom_line() +
+  theme_bw(base_size = 16) +
+  xlab("Time (weeks)") +
+  ylab("PC2") +
+  ggtitle("AML mRNA — PC2 vs Time")
+```
+
+---
+
+## 8. Project All Samples into State-Space
+
+Map every sample (Ctrl and CM) to its rotated PC2 coordinate. Samples from
+treatment groups not used in SVD construction would be projected here via `rV`.
+
+```{r}
+#| label: project-all-samples
+
+cbcol     <- colData(mrna_2018)[cbsel, ]
+aml_space <- c()
+samp_test <- c()
+
+for (i in seq_len(dim(colData(mrna_2018))[1])) {
+  cursamp   <- colData(mrna_2018)$sample_id[i]
+  samp_test <- c(samp_test, cursamp)
+
+  if (colData(mrna_2018)$treatment[i] %in% c("Ctrl", "CM")) {
+    m <- which(cbcol$sample_id == cursamp)
+    if (length(m) != 1) {
+      message("ERROR: matching sample ", cursamp)
+    } else {
+      aml_space <- c(aml_space, rU[m, 2])
+    }
+  } else {
+    message("ERROR: unrecognized treatment for sample ", cursamp)
+  }
+}
+
+tdf <- data.frame(
+  AML_space.calc = aml_space,
+  mouse_id       = colData(mrna_2018)$mouse_id,
+  sample_id      = samp_test,
+  Time           = colData(mrna_2018)$time_numeric,
+  group_name     = colData(mrna_2018)$treatment
+)
+
+head(tdf)
+```
+
+```{r}
+#| label: plot-all-trajectories
+#| fig-width: 8
+#| fig-height: 5
+
+ggplot(tdf, aes(x = Time, y = AML_space.calc,
+                color = factor(mouse_id), group = mouse_id)) +
+  geom_point() +
+  geom_line() +
+  theme_bw(base_size = 16) +
+  ggtitle("All Mice — AML State-Space Trajectories") +
+  theme(plot.title = element_text(size = 13))
+```
+
+---
+
+## 9. Outlier Sample Filtering
+
+Based on visual inspection of trajectories, the following samples are excluded
+before downstream analysis:
+
+- Mouse **3368**: hovers near the healthy state throughout; not a leukemic trajectory.
+- Mouse **3336**, week 8.0: anomalous late recovery point.
+- Mouse **3357**, all timepoints after week 3.0: post-week-3 behavior is atypical.
+
+```{r}
+#| label: filter-outliers
+
+final_tdf <- tdf %>%
+  filter(
+    mouse_id != 3368,
+    !(mouse_id == 3336 & Time == 8.0),
+    !(mouse_id == 3357 & Time > 3.0)
+  )
+
+# Verify no excluded samples remain
+violations <- final_tdf %>%
+  filter(
+    mouse_id == 3368 |
+    (mouse_id == 3336 & Time == 8.0) |
+    (mouse_id == 3357 & Time > 3.0)
+  )
+stopifnot(nrow(violations) == 0)
+
+cat("Samples remaining after filtering:", nrow(final_tdf), "\n")
+```
+
+```{r}
+#| label: plot-filtered-trajectories
+#| fig-width: 8
+#| fig-height: 5
+
+ggplot(final_tdf, aes(x = Time, y = AML_space.calc,
+                      color = factor(group_name), group = mouse_id)) +
+  geom_point() +
+  geom_line() +
+  theme_bw(base_size = 16) +
+  ggtitle("Filtered Mice — AML State-Space Trajectories") +
+  theme(plot.title = element_text(size = 13))
+```
+
+---
+
+## 10. Merge with Sample Metadata and Save
+
+```{r}
+#| label: merge-metadata
+
+mrna_2018_ss <- final_tdf %>%
+  left_join(mrna18_info, by = "sample_id")
+
+write.csv(mrna_2018_ss, "AML_2018_StateSpace_Mice.csv", row.names = FALSE)
+```
+
+---
+
+## 11. K-Means Clustering Along the AML Axis
+
+Cluster CM samples into three states along PC2 to identify empirical critical
+points of the quasi-potential.
+
+- **K1** — perturbed hematopoiesis (near-healthy)
+- **K2** — transition region
+- **K3** — deep leukemia
+
+```{r}
+#| label: load-filtered-data
+
+# Re-load if continuing from a saved file
+final_tdf <- read.csv("final_aml_mrna_state_space.csv")
+```
+
+```{r}
+#| label: kmeans-clustering
+
+tdf_cm <- final_tdf %>%
+  filter(group_name == "CM")
+
+set.seed(56)
+cm_kmeans     <- kmeans(tdf_cm$AML_space.calc, centers = 3)
+tdf_cm$cluster <- factor(cm_kmeans$cluster)
+
+cat("K-means cluster centers:\n")
+print(cm_kmeans$centers)
+```
+
+Order and label clusters along the AML progression axis:
+
+```{r}
+#| label: label-clusters
+
+cluster_centers <- tdf_cm %>%
+  group_by(cluster) %>%
+  summarise(center = mean(AML_space.calc)) %>%
+  arrange(center)
+
+cluster_centers
+
+cluster_map <- tibble(
+  cluster = factor(c(1, 2, 3)),  #Adjust so order goes from most positive centers (near health) --> negative (disease)
+  state   = c("K1_perturbed_hematopoiesis",
+              "K2_transition_region",
+              "K3_deep_leukemia")
+)
+
+tdf_cm <- tdf_cm %>%
+  left_join(cluster_map, by = "cluster")
+```
+
+```{r}
+#| label: plot-clusters
+#| fig-width: 5
+#| fig-height: 4
+
+ggplot(tdf_cm, aes(x = cluster, y = AML_space.calc)) +
+  geom_boxplot() +
+  theme_bw(base_size = 14) +
+  ggtitle("AML State Values by K-Means Cluster")
+```
+
+```{r}
+#| label: save-clustered-cm
+
+write.csv(tdf_cm, "cm2018_sp_kmeansclusters.csv", row.names = FALSE)
+```
+
+---
+
+## 12. Estimate Critical Points c₁, c₂, c₃
+
+```{r}
+#| label: critical-points
+
+# c1* : grand mean of all Ctrl samples (healthy attractor)
+c1_star <- final_tdf %>%
+  filter(group_name == "Ctrl") %>%
+  summarise(val = mean(AML_space.calc)) %>%
+  pull(val)
+
+# c1 : centroid of K1 (CM near-health cluster)
+c1 <- tdf_cm %>%
+  filter(state == "K1_perturbed_hematopoiesis") %>%
+  summarise(val = mean(AML_space.calc)) %>%
+  pull(val)
+
+# c3 : centroid of K3 (deep leukemia cluster)
+c3 <- tdf_cm %>%
+  filter(state == "K3_deep_leukemia") %>%
+  summarise(val = mean(AML_space.calc)) %>%
+  pull(val)
+
+# c2 : upper bound of K2 (transition region)
+# The unstable maximum is least-sampled; its upper boundary is the best
+# empirical estimate because a higher Boltzmann ratio is expected here.
+c2_range <- tdf_cm %>%
+  filter(state == "K2_transition_region") %>%
+  summarise(c2_lower = min(AML_space.calc),
+            c2_upper = max(AML_space.calc))
+
+c2_upper_hat <- c2_range$c2_upper
+
+cat("Critical points:\n")
+cat(sprintf("  c1*  (healthy, Ctrl centroid) : %.4f\n", c1_star))
+cat(sprintf("  c1   (K1 CM centroid)         : %.4f\n", c1))
+cat(sprintf("  c2   (K2 upper bound)         : %.4f\n", c2_upper_hat))
+cat(sprintf("  c3   (K3 CM centroid)         : %.4f\n", c3))
+
+# Ordering sanity checks
+stopifnot(c1 > c2_upper_hat, c2_upper_hat > c3)
+```
+
+```{r}
+#| label: critical-points-table
+
+critical_points <- data.frame(
+  point     = c("c1", "c2", "c3"),
+  AML_space = c(c1, c2_upper_hat, c3),
+  stability = c(
+    "Stable minimum (perturbed hematopoiesis)",
+    "Unstable maximum (transition state)",
+    "Stable minimum (leukemia)"
+  )
+)
+
+critical_points
+```
+
+---
+
+## 13. Quasi-Potential Construction
+
+The quasi-potential is a quartic polynomial whose derivative factors as:
+
+$$\frac{dU_p}{dx} = \alpha (x - c_1)(x - c_2)(x - c_3)$$
+
+Integrating gives:
+
+$$U_p(x) = \alpha \left[ \frac{x^4}{4} - \frac{(c_1+c_2+c_3)x^3}{3} + \frac{(c_1 c_2 + c_1 c_3 + c_2 c_3)x^2}{2} - c_1 c_2 c_3 \cdot x \right]$$
+
+```{r}
+#| label: define-potential
+
+alpha <- 4.85e-8   # scaling parameter (chosen to match diffusion fit)
+
+make_potential <- function(x, c1, c2, c3, alpha) {
+  alpha * (
+    x^4 / 4 -
+    (c1 + c2 + c3) * x^3 / 3 +
+    (c1*c2 + c1*c3 + c2*c3) * x^2 / 2 -
+    (c1*c2*c3) * x
+  )
+}
+```
+
+### 13a. Family of quasi-potentials across candidate c₂ values
+
+```{r}
+#| label: quasi-potential-family
+#| fig-width: 8
+#| fig-height: 5
+
+x_grid           <- seq(c3 - 50, c1 + 50, length.out = 500)
+c2_range_c1_c3   <- seq(c1, c3, length.out = 200)
+
+U_family <- lapply(c2_range_c1_c3, function(c2) {
+  make_potential(x_grid, c1, c2, c3, alpha)
+})
+
+U_family_idx    <- round(seq(1, length(c2_range_c1_c3), length.out = 10))
+U_c2_values_df  <- map_dfr(U_family_idx, function(i) {
+  tibble(x  = x_grid,
+         U  = U_family[[i]],
+         c2 = c2_range_c1_c3[i])
+})
+
+ggplot(U_c2_values_df, aes(x = x, y = U, group = c2)) +
+  geom_line(color = "gray50", linewidth = 0.7, alpha = 0.8) +
+  scale_x_reverse() +
+  geom_vline(xintercept = c(c1, c3),
+             linetype = "dashed", linewidth = 0.6) +
+  geom_vline(xintercept = c2_upper_hat,
+             linetype = "dashed", color = "red") +
+  annotate("text", x = c1, y = min(U_c2_values_df$U),
+           label = "K1", vjust = 1.0, size = 4.5) +
+  annotate("text", x = c3, y = min(U_c2_values_df$U),
+           label = "K3", vjust = 1.0, size = 4.5) +
+  annotate("text", x = c2_upper_hat, y = min(U_c2_values_df$U),
+           label = "K2 upper", vjust = 1.0, size = 4.5) +
+  labs(x  = "AML state-space (PC2)",
+       y  = expression(U[p](x)),
+       title = expression("Quasi-potentials for varying " * c[2])) +
+  theme_classic(base_size = 14)
+
+write.csv(U_c2_values_df, "quasipotential_varying_c2.csv", row.names = FALSE)
+```
+
+### 13b. Final quasi-potential — c₂ = K2 upper bound
+
+```{r}
+#| label: final-potential-k2max
+#| fig-width: 7
+#| fig-height: 5
+
+c2 <- c2_upper_hat
+
+a4 <- alpha / 4
+a3 <- -alpha * (c1 + c2 + c3) / 3
+a2 <-  alpha * (c1*c2 + c1*c3 + c2*c3) / 2
+a1 <- -alpha * (c1*c2*c3)
+a0 <- 0
+
+U_poly <- function(x) a4*x^4 + a3*x^3 + a2*x^2 + a1*x + a0
+
+U_vals                     <- U_poly(x_grid)
+U_vals_final               <- U_vals - min(U_vals)
+final_aml_potential_k2max  <- data.frame(AML_PC2_Location = x_grid,
+                                         U_vals           = U_vals_final)
+
+ggplot(final_aml_potential_k2max, aes(x = AML_PC2_Location, y = U_vals)) +
+  geom_line(color = "darkblue", linewidth = 0.7) +
+  scale_x_reverse() +
+  geom_vline(xintercept = c(c1, c2, c3),
+             linetype = "dashed", linewidth = 0.6,
+             color = c("black", "red", "darkred")) +
+  labs(x        = "AML state-space (PC2)",
+       y        = expression(U[p](x)),
+       title    = "Double-Well AML mRNA Quasi-Potential",
+       subtitle = expression(c[2] * " = K"[2] * " upper bound")) +
+  theme_classic(base_size = 14)
+
+write.csv(final_aml_potential_k2max, "aml_qp_dw_k2max.csv", row.names = FALSE)
+```
+
+### 13c. Final quasi-potential — c₂ = K2 centroid
+
+```{r}
+#| label: final-potential-k2centroid
+#| fig-width: 7
+#| fig-height: 5
+
+k2_centroid <- cm_kmeans$centers[2]
+
+a4 <- alpha / 4
+a3 <- -alpha * (c1 + k2_centroid + c3) / 3
+a2 <-  alpha * (c1*k2_centroid + c1*c3 + k2_centroid*c3) / 2
+a1 <- -alpha * (c1*k2_centroid*c3)
+a0 <- 0
+
+U_poly_centroid <- function(x) a4*x^4 + a3*x^3 + a2*x^2 + a1*x + a0
+
+U_vals_centroid              <- U_poly_centroid(x_grid)
+U_vals_centroid_final        <- U_vals_centroid - min(U_vals_centroid)
+final_aml_potential_k2cent   <- data.frame(AML_PC2_Location = x_grid,
+                                           U_vals           = U_vals_centroid_final)
+
+ggplot(final_aml_potential_k2cent, aes(x = AML_PC2_Location, y = U_vals)) +
+  geom_line(color = "darkblue", linewidth = 0.7) +
+  scale_x_reverse() +
+  geom_vline(xintercept = c(c1, k2_centroid, c3),
+             linetype = "dashed", linewidth = 0.6,
+             color = c("black", "red", "darkred")) +
+  labs(x        = "AML state-space (PC2)",
+       y        = expression(U[p](x)),
+       title    = "Double-Well AML mRNA Quasi-Potential",
+       subtitle = expression(c[2] * " = K"[2] * " centroid")) +
+  theme_classic(base_size = 14)
+
+write.csv(final_aml_potential_k2cent, "amlss_quasipotential_dwcurve.csv",
+          row.names = FALSE)
+```
+
+---
+
+## 14. Curvature Check
+
+Verify that c₁ and c₃ are local minima (U'' > 0) and c₂ is a local maximum
+(U'' < 0):
+
+```{r}
+#| label: curvature-check
+
+U_dd <- function(x, c1, c2, c3, alpha) {
+  alpha * (3*x^2 - 2*(c1 + c2 + c3)*x + (c1*c2 + c1*c3 + c2*c3))
+}
+
+cat("U''(c1) =", U_dd(c1, c1, c2_upper_hat, c3, alpha),
+    "  [should be > 0]\n")
+cat("U''(c2) =", U_dd(c2_upper_hat, c1, c2_upper_hat, c3, alpha),
+    "  [should be < 0]\n")
+cat("U''(c3) =", U_dd(c3, c1, c2_upper_hat, c3, alpha),
+    "  [should be > 0]\n")
+```
+
+---
+
+## 15. Boltzmann Ratio Across Candidate c₂ Values
+
+The Boltzmann ratio BR = Pr(c₃) / Pr(c₁) should be > 1 (samples are more
+likely to be in the leukemic basin) and increases toward the leftmost (c₁-side)
+boundary of K2. This is used to confirm that the upper bound of K2 is a
+principled choice for c₂.
+
+```{r}
+#| label: boltzmann-ratio
+#| fig-width: 7
+#| fig-height: 5
+
+kT <- 1   # Boltzmann constant × temperature; set to 1 for shape analysis
+
+BR_vals <- sapply(c2_range_c1_c3, function(c2_cand) {
+  U_c1 <- make_potential(c1, c1, c2_cand, c3, alpha)
+  U_c3 <- make_potential(c3, c1, c2_cand, c3, alpha)
+  exp(-(U_c3 - U_c1) / kT)
+})
+
+BR_df <- data.frame(c2 = c2_range_c1_c3, BR = BR_vals)
+
+ggplot(BR_df, aes(x = c2, y = BR)) +
+  geom_line(linewidth = 1.1, color = "black") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  scale_x_reverse() +
+  xlim(c1, c3) +
+  labs(x     = expression(c[2] ~ "(candidate unstable state)"),
+       y     = "Boltzmann Ratio  Pr(c₃) / Pr(c₁)",
+       title = "Boltzmann Ratio Across Candidate c₂ Values") +
+  theme_classic(base_size = 14)
+```
+
+---
+
+## 16. Monte Carlo Simulation Setup
+
+> **Next step:** Use the finalized quasi-potential to run Metropolis–Hastings
+> Monte Carlo simulations, discretize trajectories into the three macro-states
+> (K1, K2, K3), and estimate the 3×3 Markov transition matrix.
+
+*Monte Carlo simulation and Markov matrix construction are implemented in a
+separate document.*
+
+---
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```
