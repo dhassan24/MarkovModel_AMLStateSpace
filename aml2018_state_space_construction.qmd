@@ -36,7 +36,7 @@ library(patchwork)
 ```{r}
 #| label: load-data
 
-mrna_2018 <- readRDS("AML_mRNA_2018_1_real.rds")
+mrna_2018 <- readRDS("AML_mRNA_2018_1_real.rds") #Include specific file path to respective AML Transcriptome counts matrix
 ```
 
 ---
