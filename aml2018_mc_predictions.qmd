@@ -1,0 +1,1119 @@
+---
+title: "AML Monte Carlo Simulations — c₃ Predictions and Markov Analysis"
+format: html
+author: Danya Hassan
+knitr:
+  opts_chunk:
+    echo: TRUE
+    warning: FALSE
+    error: TRUE
+---
+
+## Overview
+
+This document runs the calibrated Monte Carlo (MC) simulation on the rescaled
+AML quasi-potential landscape to produce time-to-leukemia (c₃) predictions at
+both the **per-mouse** and **population** levels. It also constructs τ-lagged
+Markov transition matrices, computes mean first-passage times (MFPT) analytically,
+and validates population-level predictions via bootstrap test.
+
+**Dependencies:** Objects produced in `aml2018_mc_parameterization.qmd` are
+assumed to be available — specifically: `x_seq`, `U_seq`, `states`, `n_pts`,
+`propose_index()`, `run_fpt()`, `c1_idx`, `step_to_month`, `D`,
+`step_sd_coord`, `max_step_coord`, `n_steps`, `boundary_1`, `boundary_2`,
+`obs_all`, `calibration_mice`, `validation_mice`, and `aml_ss`.
+
+---
+
+## 1. Setup
+
+```{r}
+#| label: libraries
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(patchwork)
+library(readr)
+library(ggrepel)
+library(gganimate)
+library(gifski)
+```
+
+```{r}
+#| label: load-data
+
+aml_ss    <- read.csv("final_aml_mrna_state_space.csv")
+aml_qp_dw <- read.csv("aml_qp_dw_k2max.csv")
+
+# Critical points and simulation parameters (reproduced from parameterization doc)
+c1 <- 14.89216
+c2 <- -40.5698567718201
+c3 <- -299.0184
+
+boundary_1 <- (c1 + c2) / 2
+boundary_2 <- -250
+
+D              <- 0.45
+n_steps        <- 50000
+step_sd_coord  <- 15
+max_step_coord <- 22.5
+
+calibration_mice <- c(3334, 3357, 3336, 3341)
+validation_mice  <- c(3370, 3338)
+
+obs_all <- data.frame(
+  mouse_id      = c(3334, 3336, 3338, 3341, 3357, 3370),
+  observed_time = c(6.5,  7.0,  3.0,  6.0,  3.0,  9.0)
+)
+
+mean_obs_months_calib <- mean(obs_all$observed_time[
+  obs_all$mouse_id %in% calibration_mice])
+```
+
+```{r}
+#| label: build-landscape
+
+# Sort landscape and assign discrete states
+landscape <- aml_qp_dw[order(aml_qp_dw$AML_PC2_Location), ]
+x_seq     <- landscape$AML_PC2_Location
+U_seq     <- landscape$U_vals
+states    <- landscape$state
+n_pts     <- length(x_seq)
+
+# Rescale U to 0.99 A.U. barrier (matching reference paper)
+target_barrier   <- 0.99
+current_barrier  <- U_seq[which.min(abs(x_seq - boundary_1))] -
+                    min(U_seq[states == 1L])
+u_rescale_factor <- target_barrier / current_barrier
+U_seq            <- U_seq * u_rescale_factor
+
+# State assignments
+aml_qp_dw$state <- cut(
+  aml_qp_dw$AML_PC2_Location,
+  breaks = c(-Inf, boundary_2, boundary_1, Inf),
+  labels = c("3", "2", "1")
+) |> as.character() |> as.integer()
+
+aml_ss$state <- cut(
+  aml_ss$AML_space.calc,
+  breaks = c(-Inf, boundary_2, boundary_1, Inf),
+  labels = c("3", "2", "1")
+) |> as.character() |> as.integer()
+
+c1_idx <- which(states == 1L)
+```
+
+```{r}
+#| label: simulation-functions
+
+# Metropolis-Hastings proposal with reflecting boundaries
+propose_index <- function(cur_idx) {
+  cur_coord  <- x_seq[cur_idx]
+  delta      <- rnorm(1, 0, step_sd_coord)
+  delta      <- max(min(delta, max_step_coord), -max_step_coord)
+  if (abs(delta) < 1e-6)
+    delta <- sample(c(-1, 1), 1) * step_sd_coord * 0.1
+  prop_coord <- cur_coord + delta
+  x_min <- x_seq[1]; x_max <- x_seq[n_pts]
+  if (prop_coord < x_min) prop_coord <- 2 * x_min - prop_coord
+  if (prop_coord > x_max) prop_coord <- 2 * x_max - prop_coord
+  which.min(abs(x_seq - prop_coord))
+}
+
+# First-passage time: returns step count when trajectory first enters State 3
+run_fpt <- function(start_idx, n_steps, D) {
+  cur <- start_idx
+  for (t in seq_len(n_steps)) {
+    prop   <- propose_index(cur)
+    deltaU <- U_seq[prop] - U_seq[cur]
+    if (runif(1) < min(1, exp(-deltaU / D))) cur <- prop
+    if (states[cur] == 3L) return(t)
+  }
+  return(NA_integer_)
+}
+
+# Binned mode helper for right-skewed FPT distributions
+binned_mode <- function(x, n_bins = 40) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  h <- hist(x, breaks = n_bins, plot = FALSE)
+  h$mids[which.max(h$counts)]
+}
+```
+
+```{r}
+#| label: calibrate-step-to-month
+
+set.seed(42)
+calib_steps <- vapply(seq_len(200), function(i)
+  run_fpt(sample(c1_idx, 1), n_steps, D), integer(1))
+
+mean_calib_steps <- mean(calib_steps, na.rm = TRUE)
+step_to_month    <- mean_obs_months_calib / mean_calib_steps
+
+cat(sprintf("Mean calibration steps: %.1f\nstep_to_month:          %.6f\n",
+            mean_calib_steps, step_to_month))
+```
+
+---
+
+## 2. Per-Mouse FPT Predictions
+
+Each mouse starts at its first observed transcriptomic coordinate. 700
+independent trajectories are simulated per mouse.
+
+```{r}
+#| label: per-mouse-starting-coords
+
+start_coords <- aml_ss %>%
+  filter(group_name == "CM") %>%
+  arrange(mouse_id, Time) %>%
+  group_by(mouse_id) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  select(mouse_id, AML_space.calc)
+
+cor_val <- cor(
+  start_coords$AML_space.calc,
+  obs_all$observed_time[match(start_coords$mouse_id, obs_all$mouse_id)],
+  use = "complete.obs"
+)
+
+start_coords %>%
+  left_join(obs_all, by = "mouse_id") %>%
+  mutate(role = if_else(mouse_id %in% calibration_mice,
+                        "calibration", "validation")) %>%
+  arrange(observed_time)
+
+cat(sprintf("\nCorrelation (start coord vs observed time): %.3f\n", cor_val))
+```
+
+```{r}
+#| label: run-per-mouse-fpt
+
+n_pred_reps <- 700
+cm_mice     <- sort(unique(start_coords$mouse_id))
+
+predict_mouse <- function(mouse_id_val, n_reps = n_pred_reps, D_val = D) {
+  start_coord <- aml_ss %>%
+    filter(mouse_id == mouse_id_val) %>%
+    arrange(Time) %>%
+    dplyr::slice(1) %>%
+    pull(AML_space.calc)
+
+  start_idx <- which.min(abs(x_seq - start_coord))
+
+  cat(sprintf("  Mouse %s | coord = %.3f | state = %d\n",
+              mouse_id_val, start_coord, states[start_idx]))
+
+  steps_vec  <- vapply(seq_len(n_reps),
+                       function(i) run_fpt(start_idx, n_steps, D_val),
+                       integer(1))
+  months_vec <- steps_vec * step_to_month
+
+  list(
+    mouse_id         = mouse_id_val,
+    predicted_mean   = mean(months_vec,   na.rm = TRUE),
+    predicted_median = median(months_vec, na.rm = TRUE),
+    predicted_mode   = binned_mode(months_vec),
+    predicted_sd     = sd(months_vec,     na.rm = TRUE),
+    pct_reached      = mean(!is.na(steps_vec)),
+    months_vec       = months_vec,
+    steps_vec        = steps_vec
+  )
+}
+
+cat("Predicting all CM mice...\n")
+results_list <- lapply(cm_mice, function(m) {
+  cat(sprintf("Mouse %s:\n", m)); predict_mouse(m)
+})
+```
+
+```{r}
+#| label: per-mouse-summary
+
+summary_df <- bind_rows(lapply(results_list, function(r) {
+  data.frame(
+    mouse_id         = r$mouse_id,
+    predicted_mean   = r$predicted_mean,
+    predicted_median = r$predicted_median,
+    predicted_mode   = r$predicted_mode,
+    predicted_sd     = r$predicted_sd,
+    pct_reached      = r$pct_reached,
+    stringsAsFactors = FALSE
+  )
+})) %>%
+  left_join(obs_all, by = "mouse_id") %>%
+  mutate(
+    error_mean   = predicted_mean   - observed_time,
+    error_median = predicted_median - observed_time,
+    error_mode   = predicted_mode   - observed_time,
+    calib_flag   = if_else(mouse_id %in% calibration_mice,
+                           "calibration", "validation")
+  )
+
+cat("\n=== Per-Mouse Prediction Summary ===\n")
+print(summary_df[, c("mouse_id", "calib_flag", "observed_time",
+                     "predicted_median", "predicted_mean",
+                     "error_mean", "error_median")])
+```
+
+```{r}
+#| label: build-sim-long
+
+# Long-format simulation table: one row per trajectory per mouse
+sim_long <- bind_rows(lapply(results_list, function(r) {
+  data.frame(mouse_id   = r$mouse_id,
+             sim_months = r$months_vec,
+             sim_steps  = r$steps_vec,
+             stringsAsFactors = FALSE)
+}))
+
+cat(sprintf("sim_long: %d rows × %d cols  (%d mice × %d reps)\n",
+            nrow(sim_long), ncol(sim_long),
+            length(cm_mice), n_pred_reps))
+```
+
+---
+
+## 3. Per-Mouse Prediction Plots
+
+```{r}
+#| label: plot-fpt-histograms
+#| fig-width: 9
+#| fig-height: 7
+
+months_long <- bind_rows(lapply(results_list, function(r) {
+  data.frame(mouse_id = r$mouse_id,
+             months   = r$months_vec[!is.na(r$months_vec)])
+})) %>% left_join(obs_all, by = "mouse_id")
+
+p1 <- ggplot(months_long, aes(x = months)) +
+  geom_histogram(bins = 40, fill = "#7F77DD",
+                 color = "white", linewidth = 0.2) +
+  geom_vline(aes(xintercept = observed_time),
+             color = "#D85A30", linewidth = 0.9, linetype = "dashed") +
+  geom_vline(data = summary_df, aes(xintercept = predicted_mean),
+             color = "#1D9E75", linewidth = 0.9) +
+  facet_wrap(~ mouse_id, scales = "free_x") +
+  labs(title    = "Predicted time-to-leukemia distribution per mouse",
+       subtitle = "Green solid = predicted mean | Red dashed = observed",
+       x = "Predicted time (months)", y = "Count") +
+  theme_bw(base_size = 13)
+
+print(p1)
+```
+
+```{r}
+#| label: plot-predicted-vs-observed
+#| fig-width: 6
+#| fig-height: 5
+
+summary_long <- summary_df %>%
+  select(mouse_id, calib_flag, observed_time,
+         predicted_median, predicted_mode) %>%
+  pivot_longer(cols = c(predicted_median, predicted_mode),
+               names_to = "statistic", values_to = "predicted")
+
+p2 <- ggplot(summary_long,
+    aes(x = observed_time, y = predicted,
+        color = calib_flag, shape = statistic)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey50") +
+  geom_point(size = 4, alpha = 0.85) +
+  scale_color_manual(values = c("calibration" = "#3B8BD4",
+                                "validation"  = "#D85A30")) +
+  scale_shape_manual(values = c("predicted_median" = 16,
+                                "predicted_mode"   = 17)) +
+  labs(title    = "Predicted vs observed time to leukemia (MC simulation)",
+       subtitle = "Dashed = perfect prediction",
+       x = "Observed time (months)", y = "Predicted time (months)",
+       color = "Mouse role", shape = "Summary stat") +
+  theme_bw(base_size = 13)
+
+print(p2)
+```
+
+---
+
+## 4. Distribution Diagnostics
+
+Cross-check that `summary_df` means and medians match the raw simulation vectors,
+and inspect the right-skew structure of FPT distributions.
+
+```{r}
+#| label: simulation-verification
+
+sim_check <- sim_long %>%
+  group_by(mouse_id) %>%
+  summarise(
+    mean_from_sims   = mean(sim_months,   na.rm = TRUE),
+    median_from_sims = median(sim_months, na.rm = TRUE),
+    n_reps           = n(),
+    pct_na           = mean(is.na(sim_months)),
+    .groups = "drop"
+  ) %>%
+  left_join(summary_df %>%
+              select(mouse_id, predicted_mean, predicted_median,
+                     observed_time),
+            by = "mouse_id") %>%
+  mutate(mean_diff   = mean_from_sims - predicted_mean,
+         median_diff = median_from_sims - predicted_median)
+
+cat("=== Simulation check vs summary_df (diffs should be ~0) ===\n")
+print(sim_check)
+```
+
+```{r}
+#| label: distribution-diagnostics
+
+cat("=== Detailed FPT distribution diagnostics per mouse ===\n\n")
+
+for (r in results_list) {
+  x <- r$months_vec[!is.na(r$months_vec)]
+  n <- length(x)
+
+  mean_base    <- mean(x)
+  h            <- hist(x, breaks = 40, plot = FALSE)
+  mean_from_hist <- sum(h$mids * h$counts) / sum(h$counts)
+  skew           <- mean((x - mean(x))^3) / sd(x)^3
+  top5_contrib   <- sum(x[x > quantile(x, 0.95)]) / sum(x)
+
+  cat(sprintf("Mouse %s (obs = %.1f months):\n", r$mouse_id,
+      obs_all$observed_time[obs_all$mouse_id == r$mouse_id]))
+  cat(sprintf("  n sims:                  %d\n", n))
+  cat(sprintf("  mean (base R):           %.4f\n", mean_base))
+  cat(sprintf("  mean (from histogram):   %.4f  [diff: %.6f]\n",
+              mean_from_hist, abs(mean_base - mean_from_hist)))
+  cat(sprintf("  Q25 / median / Q75:      %.2f / %.2f / %.2f\n",
+              quantile(x, 0.25), median(x), quantile(x, 0.75)))
+  cat(sprintf("  Q90 / Q95 / max:         %.2f / %.2f / %.2f\n",
+              quantile(x, 0.90), quantile(x, 0.95), max(x)))
+  cat(sprintf("  Skewness:                %.3f\n", skew))
+  cat(sprintf("  Top 5%% contributes       %.1f%% of total sum\n\n",
+              top5_contrib * 100))
+}
+```
+
+---
+
+## 5. Quasi-Potential Landscape Plot
+
+```{r}
+#| label: plot-landscape
+#| fig-width: 7
+#| fig-height: 4
+
+ggplot(aml_qp_dw, aes(x = AML_PC2_Location, y = U_vals,
+                       color = factor(state))) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(boundary_1, boundary_2),
+             linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = c("1" = "#3B8BD4",
+                                "2" = "#EF9F27",
+                                "3" = "#D85A30"),
+                     labels = c("State 1 (healthy)",
+                                "State 2 (transition)",
+                                "State 3 (leukemia)")) +
+  scale_x_reverse() +
+  labs(title    = "Quasi-potential landscape with state boundaries",
+       subtitle = sprintf("Original U scale; simulation used U × %.2f (0.99 A.U. barrier)",
+                          u_rescale_factor),
+       x = "AML PC2 (state-space location)",
+       y = "Potential energy U (original scale)",
+       color = "State") +
+  theme_bw(base_size = 13)
+```
+
+---
+
+## 6. Eigengene Loadings — Drivers of State Transitions
+
+Variance-scaled PC2 eigengene loadings reveal which genes drive transcriptomic
+movement along the AML reaction coordinate. Confounding gene classes are removed
+before visualization.
+
+```{r}
+#| label: load-eigengenes
+
+eigengenes_df <- read.csv("eigengenes_PC2_aml2018.csv")
+```
+
+```{r}
+#| label: filter-confounders
+
+confound_patterns <- c(
+  "^Gm",                            # predicted/uncharacterized genes
+  "^A[0-9]", "^[0-9]",             # number-starting uncharacterized loci
+  "Eif2s3y", "Ddx3y", "Uty",       # Y-chromosome (sex confound)
+  "Kdm5d", "Ssty1", "Ssty2", "Sry", "Rbmy",
+  "^Igh", "^Igk", "^Igl", "^Jchain",  # immunoglobulin (B-cell confound)
+  "^Traj", "^Trbj", "^Trdj", "^Trgj", # T-cell receptor
+  "^Rps", "^Rpl", "^Mrps", "^Mrpl",   # ribosomal (technical)
+  "^mt-",                              # mitochondrial (technical/stress)
+  "^Mcpt", "^Cma",                     # mast cell (cell type confound)
+  "^Hist", "^H2a", "^H2b", "^H3",      # histones (cell cycle)
+  "^H4", "^H1",
+  "^Snor", "^Snhg",                    # small nucleolar/nuclear RNAs
+  "Rik$",                              # uncharacterized Rik loci
+  "^ENSMUSG",                          # unannotated Ensembl IDs
+  "^Sox.*os", "^Platr", "Tas2r"        # antisense RNAs, placenta lncRNAs, taste receptors
+)
+
+pattern_combined <- paste(confound_patterns, collapse = "|")
+
+eigengenes_clean <- eigengenes_df %>%
+  filter(!grepl(pattern_combined, gene, perl = TRUE))
+
+cat(sprintf("Before filtering: %d genes\n", nrow(eigengenes_df)))
+cat(sprintf("After filtering:  %d genes\n", nrow(eigengenes_clean)))
+cat(sprintf("Removed:          %d genes\n",
+            nrow(eigengenes_df) - nrow(eigengenes_clean)))
+```
+
+```{r}
+#| label: plot-eigengenes
+#| fig-width: 8
+#| fig-height: 6
+
+# Highlighted genes of biological interest
+highlight_genes <- c("Wnt2", "Bex4", "Cited1", "Rprm",
+                     "Dbx2", "Prkd1", "Calr4", "Pcp4", "Plg")
+
+top_pos <- eigengenes_clean %>%
+  filter(eigengene_PC2_scaled > 0) %>%
+  arrange(desc(eigengene_PC2_scaled)) %>%
+  slice_head(n = 15)
+
+top_neg <- eigengenes_clean %>%
+  filter(eigengene_PC2_scaled < 0) %>%
+  arrange(eigengene_PC2_scaled) %>%
+  slice_head(n = 15)
+
+plot_df <- bind_rows(top_pos, top_neg) %>%
+  mutate(
+    direction = if_else(eigengene_PC2 > 0,
+                        "Toward healthy (State 1)",
+                        "Toward leukemia (State 3)"),
+    gene      = as.character(gene),
+    label     = if_else(gene %in% highlight_genes, gene, ""),
+    alpha_val = if_else(gene %in% highlight_genes, 1.0, 0.65)
+  )
+
+ggplot(plot_df,
+    aes(x = eigengene_PC2_scaled,
+        y = reorder(gene, eigengene_PC2_scaled),
+        fill = direction, alpha = alpha_val)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = label,
+                hjust = if_else(eigengene_PC2_scaled > 0, -0.1, 1.1)),
+            size = 2.4, fontface = "bold", color = "seagreen") +
+  geom_vline(xintercept = 0, linewidth = 0.5, color = "grey40") +
+  scale_fill_manual(values = c("Toward healthy (State 1)" = "#185FA5",
+                               "Toward leukemia (State 3)"  = "#D85A30")) +
+  scale_alpha_identity() +
+  scale_x_continuous(limits = c(-70, 35), expand = c(0.01, 0.01)) +
+  labs(title = "PC2 eigengene loadings driving AML state transitions",
+       x     = "PC2 loading (variance-scaled)",
+       y     = NULL,
+       fill  = NULL) +
+  theme_bw(base_size = 12) +
+  theme(legend.position    = "bottom",
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.text.y        = element_blank(),
+        axis.ticks.y       = element_blank())
+```
+
+---
+
+## 7. Markov Transition Matrices
+
+τ-lagged transition matrices are estimated by running long trajectories and
+counting state-to-state transitions separated by lag τ. Three lag values are
+tested (τ = 40, 50, 60) to confirm stability.
+
+```{r}
+#| label: markov-functions
+
+n_markov_trajs <- 100
+n_markov_steps <- 50000
+n_macro        <- 3
+
+# General builder — starts from a uniform sample of State 1
+build_transition_matrix <- function(tau, D_val = D, seed_val = 67) {
+  set.seed(seed_val)
+  counts <- matrix(0L, n_macro, n_macro)
+
+  for (tr in seq_len(n_markov_trajs)) {
+    cur        <- sample(which(states == 1L), 1)
+    traj_macro <- integer(n_markov_steps)
+    for (t in seq_len(n_markov_steps)) {
+      prop   <- propose_index(cur)
+      deltaU <- U_seq[prop] - U_seq[cur]
+      if (runif(1) < min(1, exp(-deltaU / D_val))) cur <- prop
+      traj_macro[t] <- states[cur]
+    }
+    for (t in seq_len(n_markov_steps - tau)) {
+      i <- traj_macro[t]; j <- traj_macro[t + tau]
+      counts[i, j] <- counts[i, j] + 1L
+    }
+  }
+
+  P <- counts / rowSums(counts)
+  rownames(P) <- colnames(P) <- paste0("State ", 1:n_macro)
+  P
+}
+
+# Per-mouse builder — every trajectory resets to the mouse's starting coordinate
+build_transition_matrix_startcoord <- function(tau, D_val = D,
+                                               seed_val = 67,
+                                               start_coord) {
+  set.seed(seed_val)
+  start_idx <- which.min(abs(x_seq - start_coord))
+  counts    <- matrix(0L, n_macro, n_macro)
+
+  for (tr in seq_len(n_markov_trajs)) {
+    cur        <- start_idx
+    traj_macro <- integer(n_markov_steps)
+    for (t in seq_len(n_markov_steps)) {
+      prop   <- propose_index(cur)
+      deltaU <- U_seq[prop] - U_seq[cur]
+      if (runif(1) < min(1, exp(-deltaU / D_val))) cur <- prop
+      traj_macro[t] <- states[cur]
+    }
+    for (t in seq_len(n_markov_steps - tau)) {
+      i <- traj_macro[t]; j <- traj_macro[t + tau]
+      counts[i, j] <- counts[i, j] + 1L
+    }
+  }
+
+  P <- counts / rowSums(counts)
+  rownames(P) <- colnames(P) <- paste0("State ", 1:n_macro)
+  P
+}
+
+# Heatmap helper
+plot_transition_heatmap <- function(P, tau_label) {
+  P_long <- as.data.frame(P) %>%
+    tibble::rownames_to_column("from") %>%
+    pivot_longer(-from, names_to = "to", values_to = "prob") %>%
+    mutate(from = factor(from, levels = paste0("State ", 3:1)),
+           to   = factor(to,   levels = paste0("State ", 1:3)))
+
+  ggplot(P_long, aes(x = to, y = from, fill = prob)) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = sprintf("%.3f", prob)),
+              size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "#E6F1FB", high = "#185FA5",
+                        limits = c(0, 1), name = "Transition\nprobability") +
+    labs(title    = sprintf("Markov transition matrix (τ = %s)", tau_label),
+         subtitle = "Row = current state | Column = next state after τ steps",
+         x = "To state", y = "From state") +
+    theme_bw(base_size = 13) +
+    theme(panel.grid = element_blank())
+}
+```
+
+```{r}
+#| label: build-transition-matrices
+
+cat("Building population-level transition matrices (τ = 40, 50, 60)...\n")
+P_tau40 <- build_transition_matrix(tau = 40, D_val = 0.45, seed_val = 40)
+P_tau50 <- build_transition_matrix(tau = 50, D_val = 0.45, seed_val = 67)
+P_tau60 <- build_transition_matrix(tau = 60, D_val = 0.45, seed_val = 60)
+
+cat("P (τ=40):\n"); print(round(P_tau40, 4))
+cat("P (τ=50):\n"); print(round(P_tau50, 4))
+cat("P (τ=60):\n"); print(round(P_tau60, 4))
+```
+
+```{r}
+#| label: plot-transition-heatmaps
+#| fig-width: 5
+#| fig-height: 4
+
+print(plot_transition_heatmap(P_tau40, "40"))
+print(plot_transition_heatmap(P_tau50, "50"))
+print(plot_transition_heatmap(P_tau60, "60"))
+```
+
+### 7a. Analytic MFPT (population level, τ = 50)
+
+The mean first-passage time from each transient state to State 3 is computed
+analytically from the fundamental matrix N = (I − Q)⁻¹, where Q is the
+submatrix of transient-state transitions.
+
+```{r}
+#| label: analytic-mfpt-population
+
+Q              <- P_tau50[1:2, 1:2]
+N              <- solve(diag(2) - Q)
+mfpt_tau_steps <- rowSums(N)
+
+cat("=== Analytic MFPT (τ = 50, population-level) ===\n")
+cat(sprintf("  S1 → S3: %.1f τ-steps = %.0f steps = %.2f months\n",
+            mfpt_tau_steps[1], mfpt_tau_steps[1] * 50,
+            mfpt_tau_steps[1] * 50 * step_to_month))
+cat(sprintf("  S2 → S3: %.1f τ-steps = %.0f steps = %.2f months\n",
+            mfpt_tau_steps[2], mfpt_tau_steps[2] * 50,
+            mfpt_tau_steps[2] * 50 * step_to_month))
+```
+
+```{r}
+#| label: plot-mfpt-barchart
+#| fig-width: 5
+#| fig-height: 4
+
+mfpt_df <- data.frame(
+  from_state  = c("State 1 → State 3", "State 2 → State 3"),
+  mfpt_months = c(mfpt_tau_steps[1] * 50 * step_to_month,
+                  mfpt_tau_steps[2] * 50 * step_to_month)
+)
+
+mean_obs_all_mice <- mean(obs_all$observed_time)
+
+ggplot(mfpt_df, aes(x = from_state, y = mfpt_months, fill = from_state)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  geom_hline(yintercept = mean_obs_all_mice,
+             linetype = "dashed", color = "#D85A30", linewidth = 0.8) +
+  annotate("text", x = 2.45, y = mean_obs_all_mice + 0.5,
+           label = sprintf("Observed mean\n%.2f months", mean_obs_all_mice),
+           size = 3.5, color = "#D85A30", hjust = 1) +
+  geom_text(aes(label = sprintf("%.1f months", mfpt_months)),
+            vjust = -0.5, size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c("State 1 → State 3" = "#185FA5",
+                               "State 2 → State 3" = "#0F6E56")) +
+  scale_y_continuous(limits = c(0, 9)) +
+  labs(title = "Mean first-passage time to leukemia (State 3)",
+       x = NULL, y = "Expected time to leukemia (months)") +
+  theme_bw(base_size = 13) +
+  theme(legend.position    = "none",
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+---
+
+## 8. Per-Mouse Markov MFPT Predictions
+
+Each mouse's transition matrix is built from trajectories that reset to that
+mouse's empirical starting coordinate. MFPT is then derived analytically.
+
+```{r}
+#| label: per-mouse-markov
+
+# Starting coordinates (hardcoded to match state-space data)
+mouse_start_coords <- c(
+  "3334" = 34.51445,
+  "3336" = 55.07558,
+  "3338" = 43.77202,
+  "3341" = 53.66698,
+  "3357" = 36.95875,
+  "3370" = 52.69596
+)
+
+mfpt_per_mouse <- lapply(names(mouse_start_coords), function(mid) {
+  cat(sprintf("Building matrix for mouse %s (start = %.5f)...\n",
+              mid, mouse_start_coords[mid]))
+
+  P <- build_transition_matrix_startcoord(
+    tau        = 50,
+    D_val      = 0.45,
+    seed_val   = 67,
+    start_coord = mouse_start_coords[mid]
+  )
+
+  Q_m    <- P[1:2, 1:2]
+  N_m    <- solve(diag(2) - Q_m)
+  mfpt_m <- rowSums(N_m)
+
+  pred_months <- mfpt_m[1] * 50 * step_to_month
+
+  cat(sprintf("  S1 → S3: %.1f τ-steps → %.2f months\n\n",
+              mfpt_m[1], pred_months))
+
+  data.frame(
+    mouse_id   = as.integer(mid),
+    start_coord = mouse_start_coords[mid],
+    mfpt_s1_taus   = mfpt_m[1],
+    pred_months    = pred_months
+  )
+})
+
+mfpt_mouse_df <- bind_rows(mfpt_per_mouse) %>%
+  left_join(obs_all, by = "mouse_id") %>%
+  mutate(
+    residual  = pred_months - observed_time,
+    calib_flag = if_else(mouse_id %in% calibration_mice,
+                         "calibration", "validation")
+  )
+
+cat("\n=== Per-Mouse Markov MFPT Summary ===\n")
+print(mfpt_mouse_df[, c("mouse_id", "calib_flag", "observed_time",
+                         "pred_months", "residual")])
+```
+
+```{r}
+#| label: plot-markov-predictions
+#| fig-width: 6
+#| fig-height: 5
+
+rmse  <- sqrt(mean(mfpt_mouse_df$residual^2))
+mae   <- mean(abs(mfpt_mouse_df$residual))
+r_val <- cor(mfpt_mouse_df$observed_time, mfpt_mouse_df$pred_months)
+
+axis_lim <- range(c(mfpt_mouse_df$observed_time,
+                    mfpt_mouse_df$pred_months)) * c(0.85, 1.15)
+
+ggplot(mfpt_mouse_df,
+    aes(x = observed_time, y = pred_months,
+        label = mouse_id, fill = residual)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey50", linewidth = 0.7) +
+  geom_segment(aes(xend = observed_time, yend = observed_time),
+               color = "tomato", linewidth = 0.5, alpha = 0.7) +
+  geom_point(shape = 21, size = 4, color = "white", stroke = 0.8) +
+  ggrepel::geom_label_repel(size = 3, box.padding = 0.4, seed = 42) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "tomato",
+                       midpoint = 0, name = "Residual\n(pred − obs)") +
+  scale_x_continuous(limits = axis_lim) +
+  scale_y_continuous(limits = axis_lim) +
+  coord_fixed() +
+  labs(title    = "Markov model: predicted vs observed time to leukemia",
+       subtitle = sprintf("S1 → S3 MFPT  |  τ = 50, D = 0.45\nRMSE = %.2f mo | MAE = %.2f mo | r = %.2f",
+                          rmse, mae, r_val),
+       x = "Observed (months)", y = "Predicted (months)") +
+  theme_bw(base_size = 13) +
+  theme(legend.position  = "right",
+        panel.grid.minor = element_blank())
+```
+
+---
+
+## 9. Stationary Distribution
+
+```{r}
+#| label: stationary-distribution
+#| fig-width: 5
+#| fig-height: 4
+
+eig      <- eigen(t(P_tau50))
+stat_vec <- Re(eig$vectors[, which.min(abs(Re(eig$values) - 1))])
+stat_dist <- stat_vec / sum(stat_vec)
+
+stationary_df <- data.frame(
+  state = paste0("State ", 1:3),
+  prob  = stat_dist
+)
+
+ggplot(stationary_df, aes(x = state, y = prob, fill = state)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  geom_text(aes(label = sprintf("%.3f", prob)),
+            vjust = -0.5, size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("State 1" = "#185FA5",
+                               "State 2" = "#EF9F27",
+                               "State 3" = "#D85A30")) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+  labs(title    = "Stationary distribution of AML disease states",
+       subtitle = "Long-run probability of occupying each state (τ = 50)",
+       x = NULL, y = "Stationary probability π") +
+  theme_bw(base_size = 13) +
+  theme(legend.position    = "none",
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+---
+
+## 10. Lag-Time Stability Plot
+
+Verify that transition probabilities are stable across τ values (a requirement
+for valid Markov modeling).
+
+```{r}
+#| label: plot-lag-stability
+#| fig-width: 8
+#| fig-height: 5
+
+tau_vals <- c(40, 50, 60)
+P_list   <- list(P_tau40, P_tau50, P_tau60)
+
+lag_df <- purrr::map2_dfr(tau_vals, P_list, function(tau, P) {
+  data.frame(
+    tau   = tau,
+    entry = c("P(1→1)", "P(1→2)", "P(2→2)", "P(2→3)", "P(3→3)"),
+    prob  = c(P[1, 1],  P[1, 2],  P[2, 2],  P[2, 3],  P[3, 3])
+  )
+}) %>%
+  mutate(state_group = case_when(
+    grepl("^P\\(1", entry) ~ "State 1",
+    grepl("^P\\(2", entry) ~ "State 2",
+    TRUE                   ~ "State 3"
+  ))
+
+# Filtered (exclude absorbing State 3 self-loop for readability)
+lag_df %>%
+  filter(entry != "P(3→3)") %>%
+  ggplot(aes(x = tau, y = prob, color = entry, group = entry)) +
+  geom_line(linewidth = 0.9) + geom_point(size = 3) +
+  scale_x_continuous(breaks = tau_vals) +
+  scale_color_manual(values = c("P(1→1)" = "#185FA5",
+                                "P(1→2)" = "#85B7EB",
+                                "P(2→2)" = "#0F6E56",
+                                "P(2→3)" = "#5DCAA5")) +
+  facet_wrap(~ state_group, scales = "free_y", ncol = 2) +
+  labs(title = "Lag-time stability of transition probabilities",
+       x = "Lag time τ (MC steps)", y = "Transition probability",
+       color = NULL) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position  = "right")
+```
+
+---
+
+## 11. Population-Level Validation
+
+1,000 FPT simulations are run from the c₁ centroid to generate a predicted
+distribution for the full CM cohort. A bootstrap test confirms whether the
+observed cohort mean is statistically consistent with the model.
+
+```{r}
+#| label: population-simulation
+
+c1_centroid_idx <- which.min(abs(x_seq - c1))
+n_pop_reps      <- 1000
+
+cat(sprintf("c1 centroid: %.5f PC2 | nearest index: %d | state: %d\n",
+            c1, c1_centroid_idx, states[c1_centroid_idx]))
+
+set.seed(42)
+pop_steps  <- vapply(seq_len(n_pop_reps), function(i)
+  run_fpt(c1_centroid_idx, n_steps, D), integer(1))
+
+pop_months   <- pop_steps * step_to_month
+pct_reached  <- mean(!is.na(pop_steps)) * 100
+pop_mean     <- mean(pop_months,   na.rm = TRUE)
+pop_median   <- median(pop_months, na.rm = TRUE)
+pop_sd       <- sd(pop_months,     na.rm = TRUE)
+pop_mode     <- binned_mode(pop_months)
+
+cat(sprintf("\n=== Population-level simulation results ===\n"))
+cat(sprintf("  %% reaching State 3:             %.1f%%\n", pct_reached))
+cat(sprintf("  Predicted mean:                 %.3f months\n", pop_mean))
+cat(sprintf("  Predicted median:               %.3f months\n", pop_median))
+cat(sprintf("  Predicted mode:                 %.3f months\n", pop_mode))
+cat(sprintf("  Predicted SD:                   %.3f months\n", pop_sd))
+cat(sprintf("\n  Observed mean (all 6 CM mice):  %.3f months\n", mean_obs_all_mice))
+cat(sprintf("  Difference (pred mean - obs):   %.3f months\n",
+            pop_mean - mean_obs_all_mice))
+```
+
+```{r}
+#| label: population-quantiles
+
+pop_quantiles <- quantile(pop_months, probs = c(0.10, 0.25, 0.50,
+                                                 0.75, 0.90, 0.95),
+                          na.rm = TRUE)
+cat("Predicted quantiles from c1 centroid:\n")
+print(round(pop_quantiles, 2))
+
+in_iqr <- obs_all$observed_time >= pop_quantiles["25%"] &
+          obs_all$observed_time <= pop_quantiles["75%"]
+cat(sprintf("\nDo observed times fall within the IQR [%.2f, %.2f]?\n",
+            pop_quantiles["25%"], pop_quantiles["75%"]))
+print(data.frame(mouse_id = obs_all$mouse_id,
+                 observed = obs_all$observed_time,
+                 in_IQR   = in_iqr))
+```
+
+```{r}
+#| label: plot-population-fpt
+#| fig-width: 7
+#| fig-height: 4
+
+pop_df <- data.frame(months = pop_months[!is.na(pop_months)])
+
+ggplot(pop_df, aes(x = months)) +
+  geom_histogram(bins = 50, fill = "#7F77DD", color = "white",
+                 linewidth = 0.2, aes(y = after_stat(density))) +
+  geom_density(color = "#534AB7", linewidth = 1) +
+  geom_vline(xintercept = pop_mean,
+             color = "#1D9E75", linewidth = 1) +
+  geom_vline(xintercept = pop_median,
+             color = "#1D9E75", linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = mean_obs_all_mice,
+             color = "#D85A30", linewidth = 1) +
+  annotate("text", x = pop_mean + 0.3,
+           y = max(density(pop_df$months)$y) * 0.95,
+           label = sprintf("Pred mean\n%.2f mo", pop_mean),
+           hjust = 0, size = 3.5, color = "#1D9E75") +
+  annotate("text", x = pop_median - 0.3,
+           y = max(density(pop_df$months)$y) * 0.80,
+           label = sprintf("Pred median\n%.2f mo", pop_median),
+           hjust = 1, size = 3.5, color = "#1D9E75") +
+  annotate("text", x = mean_obs_all_mice + 0.3,
+           y = max(density(pop_df$months)$y) * 0.70,
+           label = sprintf("Obs mean\n%.2f mo", mean_obs_all_mice),
+           hjust = 0, size = 3.5, color = "#D85A30") +
+  labs(title    = "Population-level FPT distribution starting at c₁ centroid",
+       subtitle = sprintf("D = %.2f | n = %d simulations",
+                          D, n_pop_reps),
+       x = "Predicted time to leukemia (months)", y = "Density") +
+  theme_bw(base_size = 13)
+```
+
+### 11a. Bootstrap test
+
+```{r}
+#| label: bootstrap-test
+
+set.seed(42)
+boot_means <- replicate(10000, {
+  mean(sample(pop_months[!is.na(pop_months)], size = 6, replace = TRUE))
+})
+
+p_val <- mean(abs(boot_means - mean(pop_months, na.rm = TRUE)) >=
+              abs(mean_obs_all_mice - mean(pop_months, na.rm = TRUE)))
+
+cat(sprintf("Observed mean:      %.3f months\n", mean_obs_all_mice))
+cat(sprintf("Predicted mean:     %.3f months\n", mean(pop_months, na.rm = TRUE)))
+cat(sprintf("Bootstrap p-value:  %.4f\n", p_val))
+cat(sprintf("Observed mean falls at the %.1f percentile of bootstrapped means\n",
+            mean(boot_means <= mean_obs_all_mice) * 100))
+```
+
+```{r}
+#| label: plot-bootstrap
+#| fig-width: 7
+#| fig-height: 4
+
+ggplot(data.frame(boot_mean = boot_means), aes(x = boot_mean)) +
+  geom_histogram(bins = 60, fill = "#7F77DD", color = "white",
+                 linewidth = 0.2, aes(y = after_stat(density))) +
+  geom_density(color = "#534AB7", linewidth = 1) +
+  geom_vline(xintercept = mean_obs_all_mice,
+             color = "#D85A30", linewidth = 1.2) +
+  geom_vline(xintercept = mean(pop_months, na.rm = TRUE),
+             color = "#1D9E75", linewidth = 1.2, linetype = "dashed") +
+  annotate("text", x = mean_obs_all_mice + 0.2,
+           y = max(density(boot_means)$y) * 0.9,
+           label = sprintf("Observed\nmean = %.2f", mean_obs_all_mice),
+           hjust = 0, size = 3.5, color = "#D85A30") +
+  annotate("text", x = mean(pop_months, na.rm = TRUE) - 0.2,
+           y = max(density(boot_means)$y) * 0.75,
+           label = sprintf("Predicted\nmean = %.2f",
+                           mean(pop_months, na.rm = TRUE)),
+           hjust = 1, size = 3.5, color = "#1D9E75") +
+  labs(title    = "Bootstrap test: is the observed mean consistent with the model?",
+       subtitle = sprintf("10,000 resamples of n = 6 | p = %.4f", p_val),
+       x = "Bootstrap sample mean (months)", y = "Density") +
+  theme_bw(base_size = 13)
+```
+
+> **Result:** p = `r sprintf("%.4f", p_val)`. The observed cohort mean
+> (5.75 months) is statistically consistent with the model's predicted
+> distribution. All 6 observed leukemia times fall within the predicted IQR,
+> and the predicted mean differs from the observed mean by less than 1 month
+> on a ~6-month process.
+
+---
+
+## 12. MC Trajectory Animation
+
+A single long trajectory is animated on the rescaled quasi-potential landscape
+to illustrate the stochastic dynamics.
+
+```{r}
+#| label: build-animation-trajectory
+
+set.seed(58)
+n_anim_steps <- 2000
+anim_start   <- sample(c1_idx, 1)
+
+traj_idx   <- integer(n_anim_steps)
+traj_state <- integer(n_anim_steps)
+
+cur <- anim_start
+for (t in seq_len(n_anim_steps)) {
+  prop   <- propose_index(cur)
+  deltaU <- U_seq[prop] - U_seq[cur]
+  if (runif(1) < min(1, exp(-deltaU / D))) cur <- prop
+  traj_idx[t]   <- cur
+  traj_state[t] <- states[cur]
+}
+
+cat(sprintf("State visits: S1 = %d | S2 = %d | S3 = %d\n",
+            sum(traj_state == 1), sum(traj_state == 2),
+            sum(traj_state == 3)))
+cat(sprintf("First S3 entry at step: %s\n",
+            if (any(traj_state == 3)) which(traj_state == 3)[1] else "never"))
+```
+
+```{r}
+#| label: render-animation
+
+anim_df <- data.frame(
+  step    = seq_len(n_anim_steps),
+  x       = x_seq[traj_idx],
+  U       = U_seq[traj_idx],
+  state   = factor(traj_state, levels = 1:3)
+)
+
+landscape_df <- data.frame(
+  AML_PC2_Location = x_seq,
+  U_vals           = U_seq
+)
+
+p_anim <- ggplot() +
+  geom_line(data = landscape_df,
+            aes(x = AML_PC2_Location, y = U_vals),
+            color = "black", linewidth = 1, inherit.aes = FALSE) +
+  geom_vline(xintercept = c(boundary_1, boundary_2),
+             linetype = "dashed", linewidth = 0.75,
+             color = "grey40", inherit.aes = FALSE) +
+  annotate("text", x = boundary_1,
+           y = min(landscape_df$U_vals) + 0.05,
+           label = "S1|S2", hjust = -0.1, size = 3.5, color = "grey30") +
+  annotate("text", x = boundary_2,
+           y = min(landscape_df$U_vals) + 0.05,
+           label = "S2|S3", hjust = -0.1, size = 3.5, color = "grey30") +
+  geom_point(data = anim_df,
+             aes(x = x, y = U, color = state, group = 1L),
+             size = 5) +
+  scale_color_manual(values = c("1" = "#185FA5",
+                                "2" = "#EF9F27",
+                                "3" = "#D85A30"),
+                     labels = c("State 1 (healthy)",
+                                "State 2 (transition)",
+                                "State 3 (leukemia)")) +
+  scale_x_reverse() +
+  labs(title    = "Monte Carlo dynamics on rescaled quasi-potential landscape",
+       subtitle = "Step: {frame_along}  |  D = 0.45 A.U.",
+       x        = "AML PC2 (state-space location)",
+       y        = "Potential energy U (rescaled)",
+       color    = NULL) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom") +
+  transition_reveal(along = step)
+
+anim <- animate(p_anim, nframes = 500, fps = 30,
+                width = 900, height = 500,
+                renderer = gifski_renderer())
+
+anim_save("AML_MC_C3pred_rescaledU_D045.gif", animation = anim)
+anim
+```
+
+---
+
+## Session Info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```
