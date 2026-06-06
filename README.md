@@ -35,7 +35,7 @@ data from a CBFβ-SMMHC (CM) fusion-gene mouse model are used to:
 ## Repository Structure
 
 ```
-/notebooks          Quarto (.qmd) analysis documents — rendered to HTML
+/Quarto_Notebooks          Quarto (.qmd) analysis documents — rendered to HTML
 /outputs            Generated CSVs, figures, and animation outputs
 ```
 
