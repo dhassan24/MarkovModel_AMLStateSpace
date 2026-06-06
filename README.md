@@ -12,9 +12,9 @@ J.Irizarry, B.Zhang, YH.Kuo, G.Marcucci, B.Fortini, C.Espinoza, R.Rockne 
 
 ## Overview
 
-This repository reproduces and extends the transcriptomic state-space model of
-acute myeloid leukemia (AML) described in Rockne et al. (2021), applied to the
-2018 AML mouse cohort. Peripheral blood mononuclear cell (PBMC) mRNA time-series
+This repository extends the transcriptomic state-space model of
+acute myeloid leukemia (AML) described in Rockne et al. (2020), (applied to the
+2018 AML mouse cohort) into a Markov Model Framework. Peripheral blood mononuclear cell (PBMC) mRNA time-series
 data from a CBFβ-SMMHC (CM) fusion-gene mouse model are used to:
 
 1. Construct a low-dimensional transcriptomic state-space via SVD
