@@ -5,6 +5,7 @@
 Genomics Data Analytics  
 **Capstone Partner:** City of Hope — Dr. Russell Rockne Lab  
 **Capstone Committee:** Dr. Russell Rockne, Dr. Barbara Fortini, Dr. Julio Cesar Ignacio Espinoza
+
 **Acknowledgements:** Thank you to the City of Hope Department of Mathematical 
 Oncology and Beckman Research Institute for their endless support and guidance.
 D.Frankhouser, D.O’Meally, J.Ambriz, Z.Chen, YH.Fu,
